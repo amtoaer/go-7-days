@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/amtoaer/go-7-days/cache/lru"
+	"github.com/amtoaer/go-7-days/cache/singleflight"
 )
 
 // cache 对lru的进一步封装，为操作加锁
@@ -47,10 +48,11 @@ func (f GetterFunc) Get(key string) ([]byte, error) {
 }
 
 type Group struct {
-	name      string     // 名称
-	getter    Getter     // 未命中时获取数据的方法
-	mainCache cache      // 本地缓存
-	peers     PeerPicker // 远程节点的选择器
+	name      string              // 名称
+	getter    Getter              // 未命中时获取数据的方法
+	mainCache cache               // 本地缓存
+	peers     PeerPicker          // 远程节点的选择器
+	loader    *singleflight.Group // 防止重请求的中间器
 }
 
 var (
@@ -68,6 +70,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 		name:      name,
 		getter:    getter,
 		mainCache: cache{cacheBytes: cacheBytes},
+		loader:    &singleflight.Group{},
 	}
 	groups[name] = g
 	return g
@@ -99,15 +102,21 @@ func (g *Group) RegisterPeers(peers PeerPicker) { // 注册节点选择器
 }
 
 func (g *Group) load(key string) (value ByteView, err error) {
-	if g.peers != nil { // 如果节点选择器存在，尝试远程缓存
-		if peer, ok := g.peers.PickPeer(key); ok { // 通过一致性哈希获取key对应的节点数据获取器
-			if value, err = g.getFromPeer(peer, key); err == nil { // 尝试从该节点获取缓存的数据
-				return value, err
+	result, err := g.loader.Do(key, func() (interface{}, error) {
+		if g.peers != nil { // 如果节点选择器存在，尝试远程缓存
+			if peer, ok := g.peers.PickPeer(key); ok { // 通过一致性哈希获取key对应的节点数据获取器
+				if value, err = g.getFromPeer(peer, key); err == nil { // 尝试从该节点获取缓存的数据
+					return value, err
+				}
+				log.Println("[Cache]Failed to get from peer", err) // 获取失败
 			}
-			log.Println("[Cache]Failed to get from peer", err) // 获取失败
 		}
+		return g.getLocally(key) // 本机及远程缓存均不存在，本地拉取新缓存
+	})
+	if err != nil {
+		return result.(ByteView), err
 	}
-	return g.getLocally(key) // 本机及远程缓存均不存在，本地拉取新缓存
+	return ByteView{}, err
 }
 
 func (g *Group) getFromPeer(peer PeerGetter, key string) (value ByteView, err error) {
